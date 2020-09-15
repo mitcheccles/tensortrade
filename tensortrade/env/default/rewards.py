@@ -6,6 +6,7 @@ import pandas as pd
 
 from tensortrade.env.generic import RewardScheme, TradingEnv
 from tensortrade.feed.core import Stream, DataFeed
+from tensortrade.env.generic.utils.running_stats import Welfords, PctChange
 import math
 
 class TensorTradeRewardScheme(RewardScheme):
@@ -105,14 +106,17 @@ class RiskAdjustedReturns(TensorTradeRewardScheme):
         self._risk_free_rate = self.default('risk_free_rate', risk_free_rate)
         self._target_returns = self.default('target_returns', target_returns)
         self._window_size = self.default('window_size', window_size)
+        self.pct_change = PctChange()
+        self.variance = Welfords(window_size=self._window_size)
+        self.downside_variance = Welfords(window_size=self._window_size)
 
-    def _sharpe_ratio(self, returns: 'pd.Series') -> float:
+    def _sharpe_ratio(self, latest_return: 'float') -> float:
         """Computes the sharpe ratio for a given series of a returns.
 
         Parameters
         ----------
-        returns : `pd.Series`
-            The returns for the `portfolio`.
+        latest_return : `float`
+            The most recent calculation of the portfolio returns`.
 
         Returns
         -------
@@ -123,9 +127,13 @@ class RiskAdjustedReturns(TensorTradeRewardScheme):
         ----------
         .. [1] https://en.wikipedia.org/wiki/Sharpe_ratio
         """
-        return (np.mean(returns) - self._risk_free_rate + 1e-9) / (np.std(returns) + 1e-9)
+        if math.isnan(latest_return):
+            return latest_return
+        self.variance.include(latest_return)
+        return (self.variance.mean - self._risk_free_rate + 1e-9) / (self.variance.std + 1e-9)
 
-    def _sortino_ratio(self, returns: 'pd.Series') -> float:
+
+    def _sortino_ratio(self, latest_return: 'float') -> float:
         """Computes the sortino ratio for a given series of a returns.
 
         Parameters
@@ -142,12 +150,17 @@ class RiskAdjustedReturns(TensorTradeRewardScheme):
         ----------
         .. [1] https://en.wikipedia.org/wiki/Sortino_ratio
         """
-        downside_returns = returns.copy()
-        downside_returns[returns < self._target_returns] = returns ** 2
 
-        expected_return = np.mean(returns)
-        downside_std = np.sqrt(np.std(downside_returns))
+        if math.isnan(latest_return):
+            return latest_return
 
+        self.variance.include(latest_return)
+
+        downside_return = latest_return ** 2 if latest_return < self._target_returns else latest_return
+        self.downside_variance.include(downside_return)
+
+        expected_return = self.variance.mean
+        downside_std = np.sqrt(self.downside_variance.std)
         return (expected_return - self._risk_free_rate + 1e-9) / (downside_std + 1e-9)
 
     def get_reward(self, portfolio: 'Portfolio') -> float:
@@ -163,10 +176,17 @@ class RiskAdjustedReturns(TensorTradeRewardScheme):
         float
             The reward corresponding to the selected risk-adjusted return metric.
         """
-        net_worths = [nw['net_worth'] for nw in portfolio.performance.values()][-(self._window_size + 1):]
-        returns = pd.Series(net_worths).pct_change().dropna()
-        risk_adjusted_return = self._return_algorithm(returns)
+        current_step = len(portfolio.performance.keys()) - 1
+        change = self.pct_change.pct_change(portfolio.performance[current_step]["net_worth"])
+
+        risk_adjusted_return = self._return_algorithm(change)
         return risk_adjusted_return
+
+    def reset(self):
+        self.pct_change = PctChange()
+        self.variance = Welfords(window_size=self._window_size)
+        self.downside_variance = Welfords(window_size=self._window_size)
+
 
 class PBR(TensorTradeRewardScheme):
     """A reward scheme for position-based returns.
